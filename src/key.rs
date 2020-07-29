@@ -13,7 +13,7 @@ use std::str::FromStr;
 #[derive(PartialEq, Eq)]
 pub enum Key {
     /// Printable character without Ctrl or Alt
-    Bare(char),
+    Pr(char),
 
     /// Control key combination.  Note that some control keys are
     /// passed through as specific values for convenience:
@@ -98,7 +98,7 @@ impl fmt::Display for Key {
     /// Meta and Ctrl.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Key::Bare(ch) => write!(f, "{}", ch),
+            Key::Pr(ch) => write!(f, "{}", ch),
             Key::Ctrl(ch) => write!(f, "C-{}", ch),
             Key::F(num) => write!(f, "F{}", num),
             Key::Tab => write!(f, "Tab"),
@@ -165,7 +165,7 @@ impl FromStr for Key {
         if let Some(ch) = it.next() {
             if it.as_str().is_empty() {
                 return Ok(match (meta, ctrl) {
-                    (false, false) => Key::Bare(ch),
+                    (false, false) => Key::Pr(ch),
                     (false, true) => Key::Ctrl(ch),
                     (true, false) => Key::Meta(ch),
                     (true, true) => Key::MetaCtrl(ch),
@@ -273,7 +273,7 @@ impl Key {
     /// Add meta to a key if possible, otherwise return `None`
     pub fn meta(&self) -> Option<Self> {
         match self {
-            Key::Bare(ch) => Some(Key::Meta(*ch)),
+            Key::Pr(ch) => Some(Key::Meta(*ch)),
             Key::Ctrl(ch) => Some(Key::MetaCtrl(*ch)),
             Key::F(num) => Some(Key::MetaF(*num)),
             Key::Tab => Some(Key::MetaTab),
@@ -327,7 +327,7 @@ impl Key {
             },
             Some(c) if c < 0x80 => match c {
                 127 => Key::BackSp,
-                _ => Key::Bare(c as char),
+                _ => Key::Pr(c as char),
             },
             Some(c) if c < 0xC0 => Key::Invalid,
             Some(c) => {
@@ -339,7 +339,7 @@ impl Key {
                 };
                 if let Some(seq) = sc.take(len) {
                     match std::str::from_utf8(seq).ok().and_then(|s| s.chars().next()) {
-                        Some(c) => Key::Bare(c),
+                        Some(c) => Key::Pr(c),
                         None => Key::Invalid,
                     }
                 } else if !force {

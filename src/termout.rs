@@ -9,6 +9,17 @@ use std::io::{Result, Write};
 ///
 /// Note that coordinates and sizes are passed as `i32` here, because
 /// that is more convenient when relative offsets might be negative.
+/// It also allows positions modulo the screen dimensions,
+/// i.e. negative positions measuring from the right or bottom edge.
+///
+/// Calls that add to the buffer return the same `self` value,
+/// allowing the calls to be chained.
+///
+/// Not all ANSI sequences are covered here, just the basic ones
+/// require to implement a full-screen application and that are
+/// commonly supported everywhere.  If you need another ANSI sequence,
+/// it is easy to create, for example
+/// `termout.csi().num(5).asc('C')` to do "cursor forward 5 cells".
 ///
 /// [`Terminal`]: struct.Terminal.html
 pub struct TermOut {
@@ -31,13 +42,27 @@ impl TermOut {
     }
 
     /// Get the features supported by the terminal
+    #[inline]
     pub fn features(&self) -> &Features {
         &self.features
     }
 
     /// Get current terminal size: (rows, columns)
+    #[inline]
     pub fn size(&self) -> (i32, i32) {
         self.size
+    }
+
+    /// Get current terminal size-Y, i.e. rows
+    #[inline]
+    pub fn sy(&self) -> i32 {
+        self.size.0
+    }
+
+    /// Get current terminal size-X, i.e. columns
+    #[inline]
+    pub fn sx(&self) -> i32 {
+        self.size.1
     }
 
     /// Mark all the data from the start of the buffer to the current
@@ -48,8 +73,19 @@ impl TermOut {
     ///
     /// [`Terminal::flush`]: struct.Terminal.html#method.flush
     /// [`Terminal`]: struct.Terminal.html
+    #[inline]
     pub fn flush(&mut self) {
         self.flush_to = self.buf.len();
+    }
+
+    /// Add a chunk of UTF-8 string data to the output buffer.
+    ///
+    /// See also the `Write` implementation, which allows use of
+    /// `write!` and `writeln!` to add data to the buffer.
+    #[inline]
+    pub fn out(&mut self, data: &str) -> &mut Self {
+        self.buf.extend_from_slice(data.as_bytes());
+        self
     }
 
     /// Add a chunk of byte data to the output buffer.
@@ -57,116 +93,178 @@ impl TermOut {
     /// See also the `Write` implementation, which allows use of
     /// `write!` and `writeln!` to add data to the buffer.
     #[inline]
-    pub fn out(&mut self, data: &[u8]) {
+    pub fn bytes(&mut self, data: &[u8]) -> &mut Self {
         self.buf.extend_from_slice(data);
+        self
     }
 
     /// Add a single byte to the output buffer.
-    pub fn out1(&mut self, v1: u8) {
+    #[inline]
+    pub fn byt(&mut self, v1: u8) -> &mut Self {
         self.buf.push(v1);
+        self
     }
 
-    /// Add two bytes to the output buffer.
-    pub fn out2(&mut self, v1: u8, v2: u8) {
-        self.buf.push(v1);
-        self.buf.push(v2);
+    /// Add a single ASCII byte to the output buffer.
+    #[inline]
+    pub fn asc(&mut self, c: char) -> &mut Self {
+        self.buf.push(c as u8);
+        self
     }
 
-    /// Add three bytes to the output buffer.
-    pub fn out3(&mut self, v1: u8, v2: u8, v3: u8) {
-        self.buf.push(v1);
-        self.buf.push(v2);
-        self.buf.push(v3);
+    /// Add an ESC byte (27) + ASCII byte to the output buffer.
+    #[inline]
+    pub fn esc(&mut self, c: char) -> &mut Self {
+        self.buf.push(27);
+        self.buf.push(c as u8);
+        self
     }
 
-    /// Add a 1-3 digit decimal number to the output buffer, as used
-    /// in control sequences.  If number is out of range, then nearest
-    /// valid number is used.
-    pub fn out_num(&mut self, v: i32) {
+    /// Add `ESC [`, which is the CSI sequence
+    #[inline]
+    pub fn csi(&mut self) -> &mut Self {
+        self.esc('[')
+    }
+
+    /// Add a 1-3 digit decimal number (0..=999) to the output buffer,
+    /// as used in control sequences.  If number is out of range, then
+    /// nearest valid number is used.
+    pub fn num(&mut self, v: i32) -> &mut Self {
         if v <= 0 {
-            self.out1(b'0');
+            self.asc('0');
         } else if v <= 9 {
-            self.out1(v as u8 + b'0');
+            self.byt(v as u8 + b'0');
         } else if v <= 99 {
-            self.out2((v / 10) as u8 + b'0', (v % 10) as u8 + b'0');
+            self.byt((v / 10) as u8 + b'0').byt((v % 10) as u8 + b'0');
         } else if v <= 999 {
-            self.out3(
-                (v / 100) as u8 + b'0',
-                (v / 10 % 10) as u8 + b'0',
-                (v % 10) as u8 + b'0',
-            );
+            self.byt((v / 100) as u8 + b'0')
+                .byt((v / 10 % 10) as u8 + b'0')
+                .byt((v % 10) as u8 + b'0');
         } else {
-            self.out3(b'9', b'9', b'9');
+            self.asc('9').asc('9').asc('9');
         }
+        self
     }
 
     /// Add ANSI sequence to move cursor to the given coordinates.
     /// Note that coordinates are row-first, with (0,0) as top-left.
-    pub fn to(&mut self, y: i32, x: i32) {
-        self.out2(27, b'[');
-        self.out_num(y + 1);
-        self.out1(b';');
-        self.out_num(x + 1);
-        self.out1(b'H');
+    /// Coordinates are taken modulo the screen dimensions, so for
+    /// example -1,-1 is bottom-right, and (0, -10) is 10 from the
+    /// right on the top line.
+    #[inline]
+    pub fn at(&mut self, y: i32, x: i32) -> &mut Self {
+        let (sy, sx) = self.size;
+        self.csi()
+            .num(y.rem_euclid(sy) + 1)
+            .asc(';')
+            .num(x.rem_euclid(sx) + 1)
+            .asc('H')
+    }
+
+    /// Add an attribute string.  The codes passed should be the
+    /// semicolon-separated list of numeric codes, for example
+    /// "1;31;46".
+    #[inline]
+    pub fn attr(&mut self, codes: &str) -> &mut Self {
+        self.csi().out(codes).asc('m')
+    }
+
+    /// Add an attribute string to provide the given HFB colour
+    /// expressed as 3 decimal digits `HFB`, or 2 decimal digits `FB`.
+    /// This is intended for compact representation of the basic
+    /// colours.  `H` is highlight, used to control bold: 0 normal, 1
+    /// bold.  `F` and `B` are foreground and background in
+    /// colour-intensity order, 0-9: 0 black, 1 blue, 2 red, 3
+    /// magenta, 4 green, 5 cyan, 6 yellow, 7 white, 8/9 default.
+    #[inline]
+    pub fn hfb(&mut self, hfb: u8) -> &mut Self {
+        const FG: [i32; 10] = [30, 34, 31, 35, 32, 36, 33, 37, 39, 39];
+        self.out("\x1B[0;");
+        if hfb >= 100 {
+            self.out("1;");
+        }
+        self.num(FG[(hfb / 10 % 10) as usize])
+            .asc(';')
+            .num(10 + FG[(hfb % 10) as usize])
+            .asc('m')
     }
 
     /// Add ANSI sequence to switch to underline cursor
-    pub fn underline_cursor(&mut self) {
-        self.out(b"\x1B[34h");
+    #[inline]
+    pub fn underline_cursor(&mut self) -> &mut Self {
+        self.out("\x1B[34h")
     }
 
     /// Add ANSI sequence to switch to block cursor
-    pub fn block_cursor(&mut self) {
-        self.out(b"\x1B[34l");
+    #[inline]
+    pub fn block_cursor(&mut self) -> &mut Self {
+        self.out("\x1B[34l")
     }
 
     /// Add ANSI sequences to show cursor
-    pub fn show_cursor(&mut self) {
-        self.out(b"\x1B[?25h\x1B[?0c");
+    #[inline]
+    pub fn show_cursor(&mut self) -> &mut Self {
+        self.out("\x1B[?25h\x1B[?0c")
     }
 
     /// Add ANSI sequences to hide cursor
-    pub fn hide_cursor(&mut self) {
-        self.out(b"\x1B[?25l\x1B[?1c");
+    #[inline]
+    pub fn hide_cursor(&mut self) -> &mut Self {
+        self.out("\x1B[?25l\x1B[?1c")
     }
 
     /// Add ANSI sequence to move to origin (top-left)
-    pub fn origin(&mut self) {
-        self.out(b"\x1B[H");
+    #[inline]
+    pub fn origin(&mut self) -> &mut Self {
+        self.out("\x1B[H")
     }
 
     /// Add ANSI sequence to erase to end-of-line
-    pub fn erase_eol(&mut self) {
-        self.out(b"\x1B[K");
+    #[inline]
+    pub fn erase_eol(&mut self) -> &mut Self {
+        self.out("\x1B[K")
     }
 
-    /// Add ANSI sequence to erase to end-of-display
-    pub fn erase_eod(&mut self) {
-        self.out(b"\x1B[J");
+    /// Add ANSI sequence to erase whole display
+    #[inline]
+    pub fn clear(&mut self) -> &mut Self {
+        self.out("\x1B[2J")
+    }
+
+    /// Add N spaces
+    #[inline]
+    pub fn spaces(&mut self, n: i32) -> &mut Self {
+        for _ in 0..n {
+            self.asc(' ');
+        }
+        self
     }
 
     /// Add ANSI sequence to reset attributes to the default
-    pub fn attr_reset(&mut self) {
-        self.out(b"\x1B[0m");
+    #[inline]
+    pub fn attr_reset(&mut self) -> &mut Self {
+        self.out("\x1B[0m")
     }
 
     /// Add ANSI sequence to do a full reset of the terminal
-    pub fn full_reset(&mut self) {
-        self.out(b"\x1Bc");
+    #[inline]
+    pub fn full_reset(&mut self) -> &mut Self {
+        self.out("\x1Bc")
     }
 
     /// Switch to UTF-8 mode.  Useful for those terminals that don't
     /// default to UTF-8.
-    pub fn utf8_mode(&mut self) {
-        self.out(b"\x1B%G");
+    #[inline]
+    pub fn utf8_mode(&mut self) -> &mut Self {
+        self.out("\x1B%G")
     }
 
     /// Move cursor to bottom line and do a linefeed.  This results in
     /// the screen scrolling one line, and the cursor being left at
     /// the bottom-left corner.
-    pub fn scroll_up(&mut self) {
-        self.to(self.size.0 - 1, 0);
-        self.out1(10);
+    #[inline]
+    pub fn scroll_up(&mut self) -> &mut Self {
+        self.at(-1, 0).asc('\n')
     }
 
     /// Save the current contents of the output buffer as the cleanup
