@@ -3,6 +3,8 @@ use crate::{Features, Key, TermOut};
 use stakker::{fwd, timer_max, Fwd, MaxTimerKey, Share, CX};
 use std::error::Error;
 use std::mem;
+use std::panic::PanicInfo;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Actor that manages the connection to the terminal
@@ -18,12 +20,14 @@ pub struct Terminal {
     force_timer: MaxTimerKey,
     check_timer: MaxTimerKey,
     cleanup: Vec<u8>,
+    panic_hook: Arc<Box<dyn Fn(&PanicInfo<'_>) + 'static + Sync + Send>>,
 }
 
 impl Terminal {
-    /// Set up the terminal.  Sends a message to `resize` immediately,
-    /// which provides a reference to the shared [`TermOut`] which is
-    /// used to buffer and flush terminal output data.
+    /// Set up the terminal.  Sends a message back to `resize`
+    /// immediately, which provides a reference to the shared
+    /// [`TermOut`] which is used to buffer and flush terminal output
+    /// data.
     ///
     /// Whenever the window size changes, a new `resize` message is
     /// sent.  When the terminal output is paused, `None` is sent to
@@ -37,6 +41,19 @@ impl Terminal {
     /// `ActorDied::Failed`.  The actor that created the terminal can
     /// catch that and do whatever cleanup is necessary before
     /// aborting the process.
+    ///
+    /// # Panic handling
+    ///
+    /// When Rust panics, the terminal must be restored to its normal
+    /// state otherwise things would be left in a bad state for the
+    /// user (in cooked mode with no echo, requiring the user to
+    /// blindly type `reset` on the command-line).  So this code saves
+    /// a copy of the current panic handler (using
+    /// `std::panic::take_hook`), and then installs its own handler
+    /// that does terminal cleanup before calling on to the saved
+    /// panic handler.  This mean that if any custom panic handler is
+    /// needed by the application, then it must be set up before the
+    /// call to [`Terminal::init`].
     ///
     /// [`TermOut`]: struct.TermOut.html
     pub fn init(cx: CX![], resize: Fwd<Option<Share<TermOut>>>, input: Fwd<Key>) -> Option<Self> {
@@ -63,8 +80,10 @@ impl Terminal {
             force_timer: MaxTimerKey::default(),
             check_timer: MaxTimerKey::default(),
             cleanup: b"\x1Bc".to_vec(),
+            panic_hook: Arc::new(std::panic::take_hook()),
         };
         this.handle_resize(cx);
+        this.update_panic_hook();
         Some(this)
     }
 
@@ -233,9 +252,10 @@ impl Terminal {
         // Discard old hook
         let _ = std::panic::take_hook();
 
-        if !self.paused {
-            // Get the default hook to chain onto
-            let defhook = std::panic::take_hook();
+        let defhook = self.panic_hook.clone();
+        if self.paused {
+            std::panic::set_hook(Box::new(move |info| defhook(info)));
+        } else {
             let cleanup_fn = self.glue.cleanup_fn();
             let cleanup = self.cleanup.clone();
 
@@ -249,9 +269,9 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        // Drop panic hook and clean up terminal
+        let _ = std::panic::take_hook();
         if !self.paused {
-            // Drop panic hook and clean up terminal
-            let _ = std::panic::take_hook();
             self.glue.cleanup_fn()(&self.cleanup[..]);
         }
     }
