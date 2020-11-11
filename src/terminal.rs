@@ -125,6 +125,7 @@ impl Terminal {
             self.glue.input(false);
             self.termout.rw(cx).discard();
             self.termout.rw(cx).bytes(&self.cleanup[..]);
+            self.termout.rw(cx).flush();
             self.flush(cx);
             self.paused = true;
             self.update_panic_hook();
