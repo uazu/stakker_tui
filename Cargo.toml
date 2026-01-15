@@ -1,6 +1,6 @@
 [package]
 name = "stakker_tui"
-version = "0.0.4"
+version = "0.0.5"
 authors = ["Jim Peters <jim@uazu.net>"]
 edition = "2018"
 
@@ -16,7 +16,7 @@ categories = [ "command-line-interface" ]
 
 [dependencies]
 stakker = { version = "0.2", path = "../stakker" }
-stakker_mio = { version = "0.2", path = "../stakker_mio" }
+stakker_mio = { version = "0.3", path = "../stakker_mio" }
 signal-hook = "0.1"
 libc = "0.2"
 errno = "0.2"
