@@ -1,33 +1,34 @@
 use crate::os_glue::Glue;
-use crate::{Features, Key, TermOut};
-use stakker::{fwd, timer_max, Fwd, MaxTimerKey, Share, CX};
+use crate::{Features, Key, Output, TermShare, sizer::Sizer};
+use stakker::{CX, Fwd, MaxTimerKey, Share, fwd, fwd_to, lazy, timer_max};
 use std::error::Error;
-use std::mem;
-use std::panic::PanicInfo;
+use std::panic::PanicHookInfo;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 /// Actor that manages the connection to the terminal
 pub struct Terminal {
-    resize: Fwd<Option<Share<TermOut>>>,
+    resize: Fwd<Option<TermShare>>,
     input: Fwd<Key>,
-    termout: Share<TermOut>,
+    share: TermShare,
     glue: Glue,
     disable_output: bool,
     paused: bool,
+    paused_share: Arc<AtomicBool>, // Holds same value as `paused`
     inbuf: Vec<u8>,
     check_enable: bool,
     force_timer: MaxTimerKey,
     check_timer: MaxTimerKey,
     cleanup: Vec<u8>,
-    panic_hook: Arc<Box<dyn Fn(&PanicInfo<'_>) + 'static + Sync + Send>>,
+    #[allow(clippy::type_complexity)]
+    panic_hook: Arc<Box<dyn Fn(&PanicHookInfo<'_>) + 'static + Sync + Send>>,
 }
 
 impl Terminal {
     /// Set up the terminal.  Sends a message back to `resize`
-    /// immediately, which provides a reference to the shared
-    /// [`TermOut`] which is used to buffer and flush terminal output
-    /// data.
+    /// immediately, which provides a [`TermShare`] which is used to
+    /// access various means of outputting data to the terminal.
     ///
     /// Whenever the window size changes, a new `resize` message is
     /// sent.  When the terminal output is paused, `None` is sent to
@@ -42,6 +43,10 @@ impl Terminal {
     /// catch that and do whatever cleanup is necessary before
     /// aborting the process.
     ///
+    /// `sizer` is the [`Sizer`] that will be used for
+    /// measuring glyphs.  It is passed through to [`TermShare`], and
+    /// can be retrieved from there using [`Output::sizer`].
+    ///
     /// # Panic handling
     ///
     /// When Rust panics, the terminal must be restored to its normal
@@ -55,10 +60,29 @@ impl Terminal {
     /// needed by the application, then it must be set up before the
     /// call to [`Terminal::init`].
     ///
-    /// [`TermOut`]: struct.TermOut.html
-    pub fn init(cx: CX![], resize: Fwd<Option<Share<TermOut>>>, input: Fwd<Key>) -> Option<Self> {
-        // TODO: Query TERM/terminfo/environment for features to put in Features
-        let features = Features { colour_256: false };
+    /// [`Output::sizer`]: struct.Output.html#method.sizer
+    /// [`Sizer`]: sizer/struct.Sizer.html
+    /// [`TermShare`]: struct.TermShare.html
+    /// [`Terminal::init`]: struct.Terminal.html#method.init
+    pub fn init(
+        cx: CX![],
+        sizer: Sizer,
+        resize: Fwd<Option<TermShare>>,
+        input: Fwd<Key>,
+    ) -> Option<Self> {
+        let mut features = Features { colour_256: false };
+        if let Ok(env_term) = std::env::var("TERM")
+            && env_term.contains("256")
+        {
+            features.colour_256 = true;
+        } else if let Ok(output) = std::process::Command::new("tput").arg("colors").output()
+            && let Ok(colors_str) = str::from_utf8(output.stdout.as_slice())
+            && let Ok(n_colors) = colors_str.trim().parse::<u64>()
+            && n_colors >= 256
+        {
+            features.colour_256 = true;
+        }
+
         let term = cx.this().clone();
         let glue = match Glue::new(cx, term) {
             Ok(v) => v,
@@ -67,14 +91,20 @@ impl Terminal {
                 return None;
             }
         };
-        let termout = Share::new(cx, TermOut::new(features));
+        let fwd_flush = fwd_to!([cx], flush() as ());
+        let fwd_lazy_upd = fwd_to!([cx], lazy_update() as ());
+        let share = TermShare::new(Share::new(
+            cx,
+            Output::new(features, sizer, fwd_flush, fwd_lazy_upd),
+        ));
         let mut this = Self {
             resize,
             input,
-            termout,
+            share,
             glue,
             disable_output: false,
             paused: false,
+            paused_share: Arc::new(AtomicBool::new(false)),
             inbuf: Vec::new(),
             check_enable: false,
             force_timer: MaxTimerKey::default(),
@@ -101,11 +131,11 @@ impl Terminal {
     /// buffered terminal data to be flushed.  Will output even when
     /// paused.
     pub fn bell(&mut self, cx: CX![]) {
-        if !self.disable_output {
-            if let Err(e) = self.glue.write(&b"\x07"[..]) {
-                self.disable_output = true;
-                self.failure(cx, e);
-            }
+        if !self.disable_output
+            && let Err(e) = self.glue.write(&b"\x07"[..])
+        {
+            self.disable_output = true;
+            self.failure(cx, e);
         }
     }
 
@@ -123,12 +153,19 @@ impl Terminal {
         if !self.paused {
             fwd!([self.resize], None);
             self.glue.input(false);
-            self.termout.rw(cx).discard();
-            self.termout.rw(cx).bytes(&self.cleanup[..]);
-            self.termout.rw(cx).flush();
+            let o = self.share.output(cx);
+            o.discard();
+            o.bytes(&self.cleanup[..]);
+            o.flush();
+
+            // As an optimisation, change the tile generation to
+            // disable all current tiles, to stop any actors using
+            // those tiles from updating the local_page needlessly.
+            o.tile_generation = o.tile_generation.wrapping_add(1);
+
             self.flush(cx);
             self.paused = true;
-            self.update_panic_hook();
+            self.paused_share.store(true, Ordering::SeqCst);
         }
     }
 
@@ -137,10 +174,10 @@ impl Terminal {
     pub fn resume(&mut self, cx: CX![]) {
         if self.paused {
             self.paused = false;
+            self.paused_share.store(false, Ordering::SeqCst);
             self.glue.input(true);
-            self.termout.rw(cx).discard();
+            self.share.output(cx).discard();
             self.handle_resize(cx);
-            self.update_panic_hook();
         }
     }
 
@@ -151,15 +188,23 @@ impl Terminal {
         cx.fail(e);
     }
 
+    // Handle an unrecoverable failure.  Try to clean up before
+    // terminating the actor.
+    fn fail_str(&mut self, cx: CX![], msg: &str) {
+        self.pause(cx);
+        cx.fail_string(msg);
+    }
+
     /// Flush to the terminal all the data that's ready for sending
-    /// from the TermOut buffer.  Use [`TermOut::flush`] first to mark
-    /// the point up to which data should be flushed.
+    /// from the [`Output`] buffer.  Use [`Output::flush`] first to
+    /// mark the point up to which data should be flushed.
     ///
-    /// [`TermOut::flush`]: struct.TermOut.html#method.flush
-    pub fn flush(&mut self, cx: CX![]) {
-        if self.termout.rw(cx).new_cleanup.is_some() {
+    /// [`Output::flush`]: struct.Output.html#method.flush
+    /// [`Output`]: struct.Output.html
+    fn flush(&mut self, cx: CX![]) {
+        if self.share.output(cx).new_cleanup.is_some() {
             // Don't replace unless we're sure there's a new value
-            if let Some(cleanup) = mem::replace(&mut self.termout.rw(cx).new_cleanup, None) {
+            if let Some(cleanup) = self.share.output(cx).new_cleanup.take() {
                 self.cleanup = cleanup;
                 self.update_panic_hook();
             }
@@ -169,26 +214,41 @@ impl Terminal {
             if self.paused {
                 // Just drop the output whilst paused.  We'll trigger
                 // a full refresh on resuming
-                self.termout.rw(cx).drain_flush();
+                self.share.output(cx).drain_flush();
             } else {
-                let ob = self.termout.rw(cx);
-                let result = self.glue.write(ob.data_to_flush());
-                ob.drain_flush();
-                if let Err(e) = result {
-                    self.disable_output = true;
-                    self.failure(cx, e);
+                let ob = self.share.output(cx);
+                let data = ob.data_to_flush();
+                if !data.is_empty() {
+                    let result = self.glue.write(data);
+                    ob.drain_flush();
+                    if let Err(e) = result {
+                        self.disable_output = true;
+                        self.failure(cx, e);
+                    }
                 }
             }
         }
+    }
+
+    /// Set a lazy callback to do a terminal update.  Used by `Tile`
+    /// code to gather all the tile changes into a single update.
+    fn lazy_update(&mut self, cx: CX![]) {
+        lazy!([cx], |this, cx| {
+            this.share.output(cx).update_to_local_page();
+        });
     }
 
     /// Handle a resize event from the TTY.  Gets new size, and
     /// notifies upstream.
     pub(crate) fn handle_resize(&mut self, cx: CX![]) {
         match self.glue.get_size() {
-            Ok((sy, sx)) => {
-                self.termout.rw(cx).set_size(sy, sx);
-                fwd!([self.resize], Some(self.termout.clone()));
+            Ok(Some((sy, sx))) => {
+                self.share.output(cx).set_size(sy, sx);
+                fwd!([self.resize], Some(self.share.clone()));
+            }
+            Ok(None) => {
+                // Standard output is not a TTY.
+                self.fail_str(cx, "This app requires that standard output is a TTY");
             }
             Err(e) => self.failure(cx, e),
         }
@@ -244,36 +304,45 @@ impl Terminal {
         }
     }
 
-    // Install a panic hook that (if necessary) outputs the current
-    // cleanup string, restores cooked mode and then does the default
-    // panic action (e.g. dump out backtrace).  This should be called
-    // every time we switch to/from raw mode, and every time the
-    // cleanup string is changed.
+    // Install a panic hook that, if the Terminal is not paused,
+    // outputs the current cleanup string and restores cooked mode,
+    // and then in all cases does the default panic action (e.g. dump
+    // out backtrace).  This method should be called every time the
+    // cleanup string is changed.  It detects the paused state through
+    // `paused_share`, and doesn't do terminal cleanup in that case.
     fn update_panic_hook(&mut self) {
         // Discard old hook
         let _ = std::panic::take_hook();
 
         let defhook = self.panic_hook.clone();
-        if self.paused {
-            std::panic::set_hook(Box::new(move |info| defhook(info)));
-        } else {
-            let cleanup_fn = self.glue.cleanup_fn();
-            let cleanup = self.cleanup.clone();
+        let paused_share = self.paused_share.clone();
+        let cleanup_fn = self.glue.cleanup_fn();
+        let cleanup = self.cleanup.clone();
 
-            std::panic::set_hook(Box::new(move |info| {
+        std::panic::set_hook(Box::new(move |info| {
+            if !paused_share.load(Ordering::SeqCst) {
                 cleanup_fn(&cleanup[..]);
-                defhook(info);
-            }));
-        }
+            }
+            defhook(info);
+        }));
     }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        // Drop panic hook and clean up terminal
-        let _ = std::panic::take_hook();
+        // Clean up terminal if not paused
         if !self.paused {
             self.glue.cleanup_fn()(&self.cleanup[..]);
+
+            // We're not allowed to change the panic hook in this method
+            // because we might be unwinding as part of a panic.  So leave
+            // the panic hook there but disable it by setting
+            // `paused_share` to `true`.  This results in a small memory
+            // leak.  If another `Terminal` is started, then the default
+            // hook it finds will be this (disabled) panic hook.  Since
+            // running one Terminal after another is not normal behaviour,
+            // this should be okay.
+            self.paused_share.store(true, Ordering::SeqCst);
         }
     }
 }

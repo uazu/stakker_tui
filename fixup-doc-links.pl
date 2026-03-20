@@ -1,6 +1,7 @@
 #!/usr/bin/perl -w
 
-# Version: 2020-07-16
+# Version: 2026-02-09, specific to Stakker-TUI (special handling of
+# sizer/)
 #
 # This code assumes that it owns all the `[...]: ...` definitions at
 # the end of each doc comment block.  It deletes them and rewrites
@@ -46,6 +47,8 @@ sub readfile {
     return $data;
 }
 
+system("cargo doc");
+
 my $inplace = 1;
 
 my @rs = ();
@@ -56,13 +59,21 @@ push @rs, glob('src/*/*/*.rs');
 my %unknown = ();
 my @curr = ();
 my $prefix = '';
+my $top = '';
+my @BASES;
+
+for my $dir ('', 'sizer/') {
+    for my $typ (qw(struct enum trait type)) {
+        push @BASES, "$dir$typ";
+    }
+}
 
 sub process_section {
     if ($prefix eq '') {
         print OUT @curr;
         return;
     }
-    
+
     # Drop existing link-defs, and any trailing blank lines
     while (@curr > 0 && $curr[@curr-1] =~ m|^\s*//[/!]\s*\[.*\]:|) {
         pop @curr;
@@ -70,16 +81,16 @@ sub process_section {
     while (@curr > 0 && $curr[@curr-1] =~ m|^\s*//[/!]\s*$|) {
         pop @curr;
     }
-    
+
     # Make a list of [`...`] links
     my %links = ();
     my $data = join('', @curr);
     $data =~ s/```.*?```//sg;
-    while ($data =~ /(\[`[^`]+`\])[^(]/g) {
+    while ($data =~ /(\[`[^`(]+`\])[^(]/g) {
         $links{$1} = 1;
     }
     my @linkdefs = ();
-    
+
     # Generate defs for them
     for my $link (sort keys %links) {
         my $fn;
@@ -94,13 +105,15 @@ sub process_section {
 
         my @href = ();
         if ($tmp =~ /^\[`([A-Z][a-zA-Z0-9_]+)`\]$/) {
-            push @href, "${path}struct.$1.html";
-            push @href, "../${path}struct.$1.html" if $path ne '';
-            push @href, "${path}enum.$1.html";
-            push @href, "../${path}enum.$1.html" if $path ne '';
+            for my $base (@BASES) {
+                push @href, "${path}$base.$1.html";
+                push @href, "../${path}$base.$1.html" if $path ne '';
+            }
         } elsif ($tmp =~ /^\[`([A-Z][a-zA-Z0-9_]+)::([a-z][a-z0-9_]+)`\]$/) {
-            push @href, "${path}struct.$1.html#method.$2";
-            push @href, "../${path}struct.$1.html#method.$2" if $path ne '';
+            for my $base (@BASES) {
+                push @href, "${path}$base.$1.html#method.$2";
+                push @href, "../${path}$base.$1.html#method.$2" if $path ne '';
+            }
         } elsif ($tmp =~ /^\[`([A-Z][a-zA-Z0-9_]+)::([A-Z][a-zA-Z0-9_]+)`\]$/) {
             push @href, "${path}enum.$1.html#variant.$2";
             push @href, "../${path}enum.$1.html#variant.$2" if $path ne '';
@@ -118,10 +131,10 @@ sub process_section {
             $id = $1 if $fn =~ s/#([^#]*)$//;
             my $fnpath = "$DOCDIR/$fn";
             if (-f $fnpath) {
-                push @linkdefs, "$link: $href";
+                push @linkdefs, "$link: $top$href";
                 if (defined $id) {
                     my $html = readfile($fnpath);
-                    print "WARNING: Missing anchor '$id' in file: $fnpath\n" 
+                    print "WARNING: Missing anchor '$id' in file: $fnpath\n"
                         unless $html =~ /['"]$id['"]/;
                 }
                 $found = 1;
@@ -130,9 +143,9 @@ sub process_section {
         }
         if (!$found) {
             print("WARNING: Doc file not found in any of these locations:\n  " . join("\n  ", @href) . "\n");
-        } 
+        }
     }
-    
+
     # Append
     if (@linkdefs) {
         my $linepre = $curr[0];
@@ -140,39 +153,44 @@ sub process_section {
         push @curr, "$linepre\n";
         push @curr, "$linepre $_\n" for (@linkdefs);
     }
-    
+
     print OUT @curr;
 }
 
+my $changes = 0;
 for my $fnam (@rs) {
     my $ofnam = "$fnam-NEW";
     @curr = ();
     $prefix = '';
-    
+
+    $top = '';
+    $top = "../" if $fnam =~ m|/sizer|;
+
     die "Can't open file: $fnam" unless open IN, "<$fnam";
     die "Can't create file: $ofnam" unless open OUT, ">$ofnam";
     while (<IN>) {
         my $pre = '';
         $pre = $1 if m|^\s*(//[/!])|s;
-        
+
         if ($pre ne $prefix) {
             process_section();
             @curr = ();
             $prefix = $pre;
         }
-        
+
         push @curr, $_;
     }
     process_section() if @curr;
     die "Failed reading file: $fnam" unless close IN;
     die "Failed writing file: $ofnam" unless close OUT;
-    
+
     if ($inplace) {
         my $f1 = readfile($fnam);
         my $f2 = readfile($ofnam);
         if ($f1 ne $f2) {
             if (rename $ofnam, $fnam) {
                 print "Updated $fnam\n";
+                $changes++;
             } else {
                 print "Failed to rename file $ofnam to $fnam\n";
             }
@@ -185,3 +203,5 @@ for my $fnam (@rs) {
 for (sort keys %unknown) {
     print "WARNING: Link format not known: $_\n";
 }
+
+system("cargo doc") unless $changes == 0;

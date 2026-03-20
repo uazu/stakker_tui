@@ -4,3 +4,4 @@ Cargo.lock
 **/*~
 EXPORT
 *.org
+src/EastAsianWidth.txt

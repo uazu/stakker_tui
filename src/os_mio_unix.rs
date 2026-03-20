@@ -3,9 +3,9 @@
 //! call.  This will block the whole thread if the TTY is in XOFF.
 
 use crate::terminal::Terminal;
-use libc::{c_int, c_ushort, c_void, ioctl, size_t, TIOCGWINSZ};
+use libc::{POLLHUP, POLLOUT, TIOCGWINSZ, c_int, c_ushort, c_void, ioctl, size_t};
 use signal_hook::SigId;
-use stakker::{call, fwd_do, Actor, Core};
+use stakker::{Actor, Core, call, fwd_do};
 use stakker_mio::mio::Interest;
 use stakker_mio::{FdSource, MioPoll, MioSource};
 use std::io::{Error, ErrorKind, Result};
@@ -41,7 +41,7 @@ impl Glue {
 
         // Setup notification of WINCH signals
         let (read, write) = UnixStream::pair()?;
-        let sigid = signal_hook::pipe::register(signal_hook::SIGWINCH, write)?;
+        let sigid = signal_hook::low_level::pipe::register(signal_hook::consts::SIGWINCH, write)?;
         read.set_nonblocking(true)?;
         let fd = read.as_raw_fd();
         let fdsrc = FdSource::new(fd);
@@ -74,16 +74,31 @@ impl Glue {
         Ok(this)
     }
 
-    /// Get the terminal size
-    pub fn get_size(&mut self) -> Result<(i32, i32)> {
+    /// Get the terminal size.  Returns `Err` in case of unexpected
+    /// error, `Ok(None)` in case of not a TTY, `Ok(Some((sy, sx)))`
+    /// in case of a TTY.
+    pub fn get_size(&mut self) -> Result<Option<(i32, i32)>> {
         let mut ws = WinSize::default();
         match unsafe { ioctl(1, TIOCGWINSZ, &mut ws as *mut _ as *mut u8) } {
-            -1 => Err(Error::last_os_error()),
-            _ => Ok((i32::from(ws.row), i32::from(ws.col))),
+            -1 => {
+                let err = Error::last_os_error();
+                if let Some(25) = err.raw_os_error() {
+                    Ok(None)
+                } else {
+                    Err(err)
+                }
+            }
+            _ => Ok(Some((i32::from(ws.row), i32::from(ws.col)))),
         }
     }
 
     /// Write data to the terminal
+    ///
+    /// This is a blocking call, even though the convention in an
+    /// actor system is not to block and to let other actions continue
+    /// concurrently with output.  However in this case we block
+    /// because for terminal apps, we want to take no CPU when output
+    /// is blocked, for example by a pipe or XOFF state.
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
         Self::write_aux(data)
     }
@@ -98,7 +113,30 @@ impl Glue {
                 )
             };
             if cnt < 0 {
-                return Err(Error::last_os_error());
+                let e = Error::last_os_error();
+                match e.kind() {
+                    ErrorKind::Interrupted => continue,
+                    ErrorKind::WouldBlock => {
+                        let mut pollfd = libc::pollfd {
+                            fd: STDOUT_FD,
+                            events: POLLOUT | POLLHUP,
+                            revents: 0,
+                        };
+                        let ptr = &mut pollfd as *mut _;
+                        let _rv = unsafe { libc::poll(ptr, 1, -1) };
+                        // In case of rv == 1, ignore indication in
+                        // the revents (POLLERR, POLLNVAL, POLLHUP)
+                        // because in general the same error will be
+                        // returned by the write(), with more specific
+                        // info.
+                        //
+                        // In case of rv < 0 (EAGAIN, EINTR), retrying
+                        // is the correct action.  EINVAL should be
+                        // impossible, as should rv == 0.
+                        continue;
+                    }
+                    _ => return Err(e),
+                }
             }
             data = &data[cnt as usize..];
         }
@@ -127,6 +165,7 @@ impl Glue {
     /// best effort to restore the terminal to normal from the state
     /// that it's currently in, ignoring errors.  This is for use from
     /// a panic handler.
+    #[allow(clippy::type_complexity)]
     pub fn cleanup_fn(&mut self) -> Box<dyn Fn(&[u8]) + Send + Sync + 'static> {
         let saved = self.saved;
         Box::new(move |reset| {
@@ -162,7 +201,7 @@ impl Glue {
         }
 
         if 0 == unsafe { libc::isatty(STDIN_FD) } {
-            let err = Error::new(ErrorKind::Other, "Standard input is not a TTY");
+            let err = Error::other("Standard input is not a TTY");
             call!([self.term], handle_error_in(err));
             return false;
         }
@@ -192,16 +231,16 @@ impl Glue {
 
     // Restore terminal settings
     fn termios_restore(&mut self) {
-        if let Some(saved) = mem::replace(&mut self.saved, None) {
-            if 0 > unsafe {
+        if let Some(saved) = self.saved.take()
+            && 0 > unsafe {
                 libc::tcsetattr(STDIN_FD, libc::TCSANOW, &saved as *const libc::termios)
-            } {
-                let err = Error::new(
-                    Error::last_os_error().kind(),
-                    "Unable to restore terminal mode",
-                );
-                call!([self.term], handle_error_in(err));
             }
+        {
+            let err = Error::new(
+                Error::last_os_error().kind(),
+                "Unable to restore terminal mode",
+            );
+            call!([self.term], handle_error_in(err));
         }
     }
 }
@@ -209,6 +248,6 @@ impl Glue {
 impl Drop for Glue {
     fn drop(&mut self) {
         // This call cleans up the UnixStream write end
-        signal_hook::unregister(self.sigid);
+        signal_hook::low_level::unregister(self.sigid);
     }
 }

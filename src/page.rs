@@ -1,95 +1,117 @@
-use std::collections::VecDeque;
-use std::mem;
+use crate::{Region, sizer::Sizer};
+use std::rc::Rc;
 
-/// TODO: See about allowing this to be used for additional scenarios:
+pub mod region;
+
+// TODO(enhancement): See about allowing this to be used for
+// additional scenarios:
+//
+// - As a terminal emulator, accepting ANSI sequences via a pty
+// - As a direct driver for a display
+// - As a relay between a terminal emulator and a driver
+//    (i.e. Page->Page relay over TCP)
+// - To be queried locally (search for text, etc)
+//
+// This means it would be possible to write stuff like tmux, or
+// alacritty, or a TUI testing app (typebot), or something that wraps
+// a TUI app in an outer TUI shell (window in window).
+//
+// So this means simulating or downgrading more features.  So for
+// example we could run with 16 colours, and downgrade anything else,
+// or else directly support 256 or 16M colours.  Or downgrade
+// double-space chars to U+FFFD and pass them through like that.
+
+// TODO(enhancement): Enable scrolling to be passed through
+//
+// Maybe have a map from display row to storage row.  So on scrolling,
+// the map is scrolled, but the storage isn't (except for the deleted
+// line which is cleared and becomes the new last line).  So the
+// update relayed would be a change in the map only.  For a display
+// driver, this means rendered line storage just needs writing to the
+// display in a different order.
+
+/// Default terminal colours, either white-on-black or black-on-white,
+/// according to the terminal type and configuration
+const DEFAULT_HFB: u16 = 99;
+
+/// A whole page of text
 ///
-/// - As a terminal emulator, accepting ANSI sequences via a pty
-/// - As a direct driver for a display
-/// - As a relay between a terminal emulator and a driver
-///    (i.e. Page->Page relay over TCP)
-/// - To be queried locally (search for text, etc)
+/// This is a local copy of the entire terminal screen where the
+/// required display can be built up before sending to the terminal
+/// with an update [`TermShare::update`].
 ///
-/// This means it would be possible to write stuff like tmux, or
-/// alacritty, or a TUI testing app (typebot), or something that wraps
-/// a TUI app in an outer TUI shell (window in window).
+/// This allows drawing text locally with clipping via the [`Region`]
+/// struct.  Coordinates are all `i32` to allow for display objects to
+/// be partially off the page edges.  Each row stores cells with a
+/// width in bytes according to the largest glyph in that row.  So
+/// storage adapts to the data.
 ///
-/// So this means simulating or downgrading more features.  So for
-/// example we could run with 16 colours, and downgrade anything else,
-/// or else directly support 256 or 16M colours.  Or downgrade
-/// double-space chars to U+FFFD and pass them through like that.
-
-/// TODO: Option to choose character handling model to match
-/// capabilities of eventual display device: Simple, just common
-/// single-space single-codepoint characters (e.g. European + lines),
-/// no combining characters, no unicode tables, no right-to-left, no
-/// wide characters, and anything unknown becomes U+FFFD.  Combining:
-/// in addition normalizes combining characters (requires unicode
-/// tables).  Right-to-left: also handles arab/hebrew script.  Wide:
-/// also handles CJK / emojis.
-
-/// TODO: To enable scrolling to be passed through, have a map from
-/// display row to storage row.  So on scrolling, the map is scrolled,
-/// but the storage isn't (except for the deleted line which is
-/// cleared and becomes the new last line).  So the update relayed
-/// would be a change in the map only.  For a display driver, this
-/// means rendered line storage just needs writing to the display in a
-/// different order.
-
-const ERR_HFB: u16 = 162; // Bright yellow on red
-
-/// This represents a local mutable copy of a whole page of text.
+/// Cloning a `Page` is efficient as the cloned page shares the same
+/// row data as the original, and does copy-on-write.
 ///
-/// It allows drawing text locally with clipping.  This handles both
-/// monospaced terminals, and terminals with variable-width fonts.
-/// Coordinates are all `i32` to allow for display objects to be
-/// partially off the page edges.  For efficiency text is stored as
-/// whole strings rather than individual cells.  Internally updates
-/// are just appended to the row and merged in when the line is
-/// normalized, usually just before being updated to the actual
-/// display.  For strings being displayed, private use codepoints from
-/// U+E000 to U+F8FF are used for zero-width attribute/colour changes,
-/// giving 6400 colour-pairs/attribute-sets.
+/// [`Region`]: struct.Region.html
+/// [`TermShare::update`]: struct.TermShare.html#method.update
+#[derive(Clone)]
 pub struct Page {
+    sizer: Sizer,
+
     // Page height (size-Y), in lines
     sy: i32,
 
-    // Page width (size-X), in pixels
+    // Page width (size-X), in cells
     sx: i32,
 
-    // Cell width.  For a text terminal this is 1, as each
-    // "picture-element" (pixel) is a cell.  For a graphical
-    // variable-width font terminal, this will be the width of a
-    // standard-sized character, e.g. x-width or digit-width.
-    csx: i32,
+    // Cursor position if displayed, else `None`
+    pub(super) cursor: Option<(i32, i32)>,
 
     // Rows
     rows: Vec<Row>,
 }
 
 impl Page {
-    /// Create a new page with `sy` rows and width of `sx` pixels,
-    /// filled with spaces with the given attribute `hfb`.  Note that
-    /// for a monospaced terminal the "picture-element" (pixel) is
-    /// considered to be the character cell, so `sx` is measured in
-    /// cells.
-    pub fn new(sy: i32, sx: i32, hfb: u16) -> Self {
+    /// Create a new page with `sy` rows and width of `sx` cells,
+    /// filled with spaces with the given attribute `hfb`, and with
+    /// `sizer` to determine glyph boundaries and widths.
+    ///
+    /// In general it's easier to create a new page using
+    /// [`TermShare::page`].
+    ///
+    /// [`TermShare::page`]: struct.TermShare.html#method.page
+    pub fn new(sy: i32, sx: i32, hfb: u16, sizer: Sizer) -> Self {
         let sy = sy.max(0);
         let sx = sx.max(0);
-        let csx = Scan(b"8").measure_rest() as i32;
+        let empty = Row::new(hfb, sx);
         let mut rows = Vec::with_capacity(sy as usize);
-        rows.resize_with(sy as usize, || Row::new(sx as u16, hfb));
-        Self { sy, sx, csx, rows }
+        rows.resize_with(sy as usize, || empty.clone());
+        Self {
+            sizer,
+            sy,
+            sx,
+            cursor: None,
+            rows,
+        }
     }
 
-    /// Return the standard cell-width.  This will be the size of an
-    /// average character for a variable-width font, or else 1 for a
-    /// monospaced font.
-    pub fn cell_sx(&self) -> i32 {
-        self.csx
+    /// Create a dummy empty page, of zero size
+    pub fn empty() -> Self {
+        Self::new(0, 0, DEFAULT_HFB, crate::sizer::SimpleSizer::new())
     }
 
-    /// Return a Region representing the full area of the page for
+    /// Width of page in cells
+    #[inline]
+    pub fn sx(&self) -> i32 {
+        self.sx
+    }
+
+    /// Height of page in lines
+    #[inline]
+    pub fn sy(&self) -> i32 {
+        self.sy
+    }
+
+    /// Return a `Region` representing the full area of the page for
     /// drawing on.
+    #[inline]
     pub fn full(&mut self) -> Region<'_> {
         let sy = self.sy;
         let sx = self.sx;
@@ -103,12 +125,16 @@ impl Page {
             cx0: 0,
             cy1: sy,
             cx1: sx,
+            wy: 0,
+            wx: 0,
+            hfb: DEFAULT_HFB,
         }
     }
 
-    /// Generate a region that may be any size, inside or outside the
-    /// actual page.  When drawn to, only the part of the region that
-    /// overlaps the actual page will be affected.
+    /// Generate a `Region` that may be any size, inside or outside
+    /// the actual page.  When drawn to, only the part of the region
+    /// that overlaps the actual page will be affected.
+    #[inline]
     pub fn region(&mut self, y: i32, x: i32, sy: i32, sx: i32) -> Region<'_> {
         let page_sy = self.sy;
         let page_sx = self.sx;
@@ -122,805 +148,485 @@ impl Page {
             cx0: x.max(0),
             cy1: (y + sy).min(page_sy),
             cx1: (x + sx).min(page_sx),
+            wy: 0,
+            wx: 0,
+            hfb: DEFAULT_HFB,
         }
     }
 
-    /// Measures some text to see how many pixels it will take up
+    /// Measures some text to see how many cells it will take up
+    /// horizontally.  Skips HFB sequences of the form `\0ZZZ`
     pub fn measure(&mut self, text: &str) -> i32 {
-        Scan(text.as_bytes()).measure_rest() as i32
+        region::Scan::new(text.as_bytes()).measure_rest(&self.sizer) as i32
     }
 
-    /// Normalize all rows in the page, meaning apply all the updates
-    /// made and store the data in the minimum form.
-    pub fn normalize(&mut self) {
-        let mut glyphs1 = VecDeque::with_capacity((self.sx * 2 / self.csx) as usize);
-        let mut glyphs2 = VecDeque::with_capacity((self.sx * 2 / self.csx) as usize);
-        let mut spare = Row::new(self.sx as u16, ERR_HFB);
-        for y in 0..self.sy {
-            self.rows[y as usize].normalize(self.sx as u16, &mut glyphs1, &mut glyphs2, &mut spare);
-        }
-    }
-}
-
-// Temporary storage of a glyph whilst normalizing
-#[derive(Copy, Clone)]
-struct Glyph {
-    hfb: u16,   // Colour-pair
-    x: u16,     // X-position at which glyph appears
-    sx: u16,    // Width of region in which glyph appears
-    shift: u16, // Left-shift of glyph in pixels
-    len: u16,   // Length of glyph data, or 0 for padding
-    wid: u16,   // Natural width of glyph, or 0 for padding
-    off: u32,   // Offset into data of glyph, or 0 for padding
-}
-
-impl Glyph {
-    fn equal(a: &Self, adata: &[u8], b: &Self, bdata: &[u8]) -> bool {
-        a.hfb == b.hfb
-            && a.x == b.x
-            && a.sx == b.sx
-            && a.shift == b.shift
-            && a.len == b.len
-            && a.wid == b.wid
-            && adata[a.off as usize..a.off as usize + a.len as usize]
-                == bdata[b.off as usize..b.off as usize + b.len as usize]
-    }
-}
-
-/// This is a temporary view of the page that allows writing text to a
-/// region of the page, with clipping.
-pub struct Region<'a> {
-    page: &'a mut Page,
-    // Offset to add to region coords to get to page coords
-    oy: i32,
-    ox: i32,
-    // Size of region
-    sy: i32,
-    sx: i32,
-    // Clip region in page coords, from (cy0,cx0) to (cy1,cx1)
-    cy0: i32,
-    cx0: i32,
-    cy1: i32,
-    cx1: i32,
-}
-
-impl<'a> Region<'a> {
-    /// Generate a sub-region that may be any size, inside or outside
-    /// this region.  When drawn to, only the part of the sub-region
-    /// that overlaps this region (and all its parent regions) will be
-    /// affected.
-    pub fn region(&mut self, y: i32, x: i32, sy: i32, sx: i32) -> Region<'_> {
-        let oy = self.oy + y;
-        let ox = self.ox + x;
-        Region {
-            page: self.page,
-            oy,
-            ox,
-            sy,
-            sx,
-            cy0: self.cy0.max(oy),
-            cx0: self.cx0.max(ox),
-            cy1: self.cy1.min(oy + sy),
-            cx1: self.cx1.min(ox + sx),
+    /// Set the cursor position, or hide the cursor if `None` is
+    /// passed.  If the cursor position is provided but is off the
+    /// page, then the cursor is hidden instead.
+    pub fn set_cursor(&mut self, cursor: Option<(i32, i32)>) {
+        if let Some((y, x)) = cursor
+            && y >= 0
+            && y < self.sy
+            && x >= 0
+            && x < self.sx
+        {
+            self.cursor = cursor;
+        } else {
+            self.cursor = None;
         }
     }
 
-    /// Clear the whole region to space characters of the given `hfb`
-    /// colour.  This will be clipped according to the current and
-    /// parent regions.
-    pub fn clear(&mut self, hfb: u16) {
-        if self.cx0 <= 0 && self.cx1 >= self.page.sx {
-            for y in self.cy0..self.cy1 {
-                let row = &mut self.page.rows[y as usize];
-                row.replace_all();
-                row.span(0, self.page.sx as u16, 0);
-                row.hfb(hfb);
+    /// Get the cursor position, or `None` if hidden
+    pub fn cursor(&self) -> Option<(i32, i32)> {
+        self.cursor
+    }
+
+    /// Scroll the given region `y0..y1` up the given number of lines.
+    /// Empty lines are filled with spaces of the given `hfb` colour.
+    /// This is very efficient as it manipulates whole rows.
+    pub fn scroll_up(&mut self, y0: i32, y1: i32, count: i32, hfb: u16) {
+        let y0 = y0.max(0);
+        let y1 = y1.min(self.sy);
+        let mov = y1 - y0 - count;
+        let count = count.min(y1 - y0);
+        if mov > 0 {
+            for i in 0..mov {
+                self.rows.swap((y0 + i) as usize, (y0 + i + count) as usize);
+            }
+        }
+        let empty = Row::new(hfb, self.sx);
+        for i in 0..count {
+            self.rows[(y1 - count + i) as usize] = empty.clone();
+        }
+    }
+
+    /// Scroll the given region `y0..y1` down by the given number of
+    /// lines.  Empty lines are filled with spaces of the given `hfb`
+    /// colour.  This is very efficient as it manipulates whole rows.
+    pub fn scroll_down(&mut self, y0: i32, y1: i32, count: i32, hfb: u16) {
+        let y0 = y0.max(0);
+        let y1 = y1.min(self.sy);
+        let mov = y1 - y0 - count;
+        let count = count.min(y1 - y0);
+        if mov > 0 {
+            for i in 1..=mov {
+                self.rows.swap((y1 - i) as usize, (y1 - i - count) as usize);
+            }
+        }
+        let empty = Row::new(hfb, self.sx);
+        for i in 0..count {
+            self.rows[(y0 + i) as usize] = empty.clone();
+        }
+    }
+
+    /// Copy lines from one part of a page to another, from line
+    /// `ya..ya+sy` to `yb..yb+sy`.  Handles overlapping copies
+    /// correctly.  Clips to page size before copying.  Since this
+    /// copies whole rows using CoW it is very efficient.
+    pub fn copy_lines(&mut self, mut ya: i32, mut yb: i32, mut sy: i32) {
+        // Clip top side
+        let yadj = 0.max(-ya).max(-yb);
+        ya += yadj;
+        yb += yadj;
+        sy -= yadj;
+
+        // Clip bottom side
+        let syadj = 0.max(ya + sy - self.sy).max(yb + sy - self.sy);
+        sy -= syadj;
+
+        if sy > 0 {
+            if ya >= yb {
+                for i in 0..sy {
+                    self.rows[(yb + i) as usize] = self.rows[(ya + i) as usize].clone();
+                }
+            } else {
+                for i in 1..=sy {
+                    self.rows[(yb + sy - i) as usize] = self.rows[(ya + sy - i) as usize].clone();
+                }
+            }
+        }
+    }
+
+    /// Copy one region with size `(sy,sx)` at `(ya,xa)` to another at
+    /// `(yb,xb)`, cell by cell.  Handles overlapping regions
+    /// correctly.  Clips to page size before copying.
+    pub fn copy_region(
+        &mut self,
+        mut ya: i32,
+        mut xa: i32,
+        mut yb: i32,
+        mut xb: i32,
+        mut sy: i32,
+        mut sx: i32,
+    ) {
+        // Clip top side
+        let yadj = 0.max(-ya).max(-yb);
+        ya += yadj;
+        yb += yadj;
+        sy -= yadj;
+
+        // Clip bottom side
+        let syadj = 0.max(ya + sy - self.sy).max(yb + sy - self.sy);
+        sy -= syadj;
+
+        // Clip left side
+        let xadj = 0.max(-xa).max(-xb);
+        xa += xadj;
+        xb += xadj;
+        sx -= xadj;
+
+        // Clip right side
+        let sxadj = 0.max(xa + sx - self.sx).max(xb + sx - self.sx);
+        sx -= sxadj;
+
+        if sx > 0 && sy > 0 {
+            let mut buf = Vec::new();
+            if ya >= yb {
+                for i in 0..sy {
+                    self.rows[(ya + i) as usize].get_subrow(xa, xa + sx, &mut buf);
+                    self.rows[(yb + i) as usize].set_subrow(xb, &buf);
+                }
+            } else {
+                for i in 1..=sy {
+                    self.rows[(ya + sy - i) as usize].get_subrow(xa, xa + sx, &mut buf);
+                    self.rows[(yb + sy - i) as usize].set_subrow(xb, &buf);
+                }
+            }
+        }
+    }
+
+    /// Calculate the changes required to update the `old` page to
+    /// match the `new` page, row by row.  `cb` is called as `cb(y,
+    /// bitmap, row)` for each row which needs updating.  The bitmap
+    /// has a flag set for each cell that needs updating.  It is
+    /// mutable, but any changes made to it are ignored.
+    pub(super) fn changes(
+        old: &mut Self,
+        new: &mut Self,
+        mut cb: impl FnMut(i32, &mut [bool], &Row),
+    ) {
+        let sx = new.sx;
+        let sy = new.sy;
+        if old.sx != sx || old.sy != sy {
+            // Resized, so we have no idea the state of the screen.
+            // Force it all to be updated.  However it would be better
+            // if this were handled at a higher level, where the
+            // screen could be cleared to a known colour, saving on
+            // these updates.
+
+            for y in 0..sy {
+                let mut bitmap = vec![true; sx as usize];
+                let row = new.rows.get_mut(y as usize).unwrap();
+                cb(y, &mut bitmap, row);
             }
         } else {
-            for y in self.cy0..self.cy1 {
-                let row = &mut self.page.rows[y as usize];
-                row.span(self.cx0 as u16, (self.cx1 - self.cx0) as u16, 0);
-                row.hfb(hfb);
-            }
-        }
-    }
-
-    /// Write some text rightwards from the given location.  This will
-    /// be clipped according to the current and parent regions.
-    /// Embedded colour changes using U+E000 to U+F8FF are permitted.
-    /// Returns the next X-position after the text.  Note that even if
-    /// the text is partially or fully outside the clip region, the
-    /// returned X-position will be correct relative to the starting
-    /// point.  (This is required in case we're building up some text
-    /// in parts starting off to the left that eventually will come
-    /// into a visible region, or in case the returned X-position will
-    /// be used to position something else.)
-    pub fn write(&mut self, y: i32, x: i32, hfb: u16, text: &str) -> i32 {
-        self.writeb(y, x, hfb, text.as_bytes())
-    }
-
-    fn writeb(&mut self, y: i32, x: i32, mut hfb: u16, text: &[u8]) -> i32 {
-        let mut p = Scan(text);
-        let y = y + self.oy;
-        let mut x = x + self.ox;
-
-        if y < self.cy0 || y >= self.cy1 {
-            // Just measure string
-            return x + p.measure_rest() as i32 - self.ox;
-        }
-
-        // Skip stuff we can't display
-        if x < self.cx0 {
-            loop {
-                let rewind = p;
-                match p.measure() {
-                    Meas::End => return x,
-                    Meas::Attr(v) => hfb = v,
-                    Meas::Glyph(inc) => {
-                        x += inc as i32;
-                        if x > self.cx0 {
-                            x -= inc as i32;
-                            p = rewind;
-                            break;
-                        }
-                        if x == self.cx0 {
-                            break;
-                        }
-                    }
-                }
-            }
-            // `x` may still be < self.cx0 if the first character
-            // spans x == self.cx0
-        }
-
-        if x >= self.cx1 {
-            // Just measure string
-            return x + p.measure_rest() as i32 - self.ox;
-        }
-
-        // Write what we can display
-        let row = &mut self.page.rows[y as usize];
-        let x0 = x.max(self.cx0);
-        let shift = x0 - x;
-        let start = p;
-        loop {
-            match p.measure() {
-                Meas::Glyph(inc) => {
-                    x += inc as i32;
-                    if x >= self.cx1 {
-                        row.span(x0 as u16, (self.cx1 - x0) as u16, shift as u16);
-                        row.hfb(hfb);
-                        row.add_slice(start.slice_to(&p));
-                        return x + p.measure_rest() as i32 - self.ox;
-                    }
-                }
-                Meas::Attr(_) => (),
-                Meas::End => {
-                    row.span(x0 as u16, (x - x0) as u16, shift as u16);
-                    row.hfb(hfb);
-                    row.add_slice(start.0);
-                    return x - self.ox;
+            let mut bitmap = vec![false; sx as usize];
+            for y in 0..sy {
+                let r0 = &mut old.rows[y as usize];
+                let r1 = &mut new.rows[y as usize];
+                if r0.changes_bitmap(r1, &mut bitmap) {
+                    cb(y, &mut bitmap, r1);
                 }
             }
         }
     }
+}
 
-    /// Write a text field to the whole region.  The data may have
-    /// embedded colour codes.  Overflow markers will be written to
-    /// the start or end if the field contents overflows.  The cursor
-    /// position will be returned if the cursor is visible.  `shift`
-    /// gives the number of pixels leftwards to shift the text.
-    /// `cursor` gives the byte offset into the text where the cursor
-    /// is located.  `hfb` gives the initial colour for the text,
-    /// before the first colour sequence (if any).  `bg_hfb` gives the
-    /// colour to use for the end of the field where no text appears.
-    /// `ov_hfb` gives the colour to use for the overflow markers.
-    pub fn field(
-        &'a mut self,
-        mut shift: i32,
-        cursor: usize,
-        mut hfb: u16,
-        bg_hfb: u16,
-        ov_hfb: u16,
-        text: &str,
-    ) -> Option<(i32, i32)> {
-        let curs_len = text.len().saturating_sub(cursor);
-        let mut p = Scan(text.as_bytes());
-        let mut x = 0;
-        let mut y = 0;
+impl Default for Page {
+    /// Defaults to an empty 0x0-sized page
+    fn default() -> Self {
+        Self::empty()
+    }
+}
 
-        // Handle shift
-        if shift > 0 {
-            x = self.writeb(y, x, ov_hfb, b"<");
-            loop {
-                let rewind = p;
-                match p.measure() {
-                    Meas::End => break,
-                    Meas::Attr(v) => hfb = v,
-                    Meas::Glyph(inc) => {
-                        shift -= inc as i32;
-                        if shift < 0 {
-                            p = rewind;
-                        }
-                        if shift <= 0 {
-                            break;
-                        }
-                    }
-                }
-            }
+impl std::fmt::Debug for Page {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Page sy={} sx={} cursor={:?}:",
+            self.sy, self.sx, self.cursor
+        )?;
+        for row in &self.rows {
+            write!(f, "\n  {row:?}")?;
         }
-
-        // Write all glyphs that can fit on each line.
-        let mut curs = None;
-        let mut before_curs = p.0.len() >= curs_len;
-        let mut sx = self.sx;
-        let mut overflow = false;
-        let sy = self.sy;
-        while y < sy {
-            if y == sy - 1 {
-                // Final line -- check whether we are going to overflow, and
-                // leave space for overflow character.
-                let mut scan_p = p;
-                let mut scan_x = x;
-                while scan_x < sx {
-                    match scan_p.measure() {
-                        Meas::Glyph(inc) => scan_x += inc as i32,
-                        Meas::Attr(_) => (),
-                        Meas::End => break,
-                    }
-                }
-                overflow = scan_x >= sx;
-                if overflow {
-                    sx -= Scan(b">").measure_rest() as i32;
-                }
-            }
-
-            let start = p;
-            let x0 = x;
-            loop {
-                let rewind = p;
-                match p.measure() {
-                    Meas::End => break,
-                    Meas::Attr(v) => hfb = v,
-                    Meas::Glyph(inc) => {
-                        if x + inc as i32 > sx {
-                            p = rewind;
-                            x = self.writeb(y, x0, hfb, start.slice_to(&p));
-                            if p.0.len() == curs_len && x < sx {
-                                // This will be overridden by code
-                                // below if we have another line
-                                curs = Some((y, x));
-                            }
-                            if x < sx {
-                                self.region(y, x, 1, sx - x).clear(bg_hfb);
-                            }
-                            break;
-                        }
-                        if before_curs && p.0.len() < curs_len {
-                            before_curs = false;
-                            curs = Some((y, x));
-                        }
-                        x += inc as i32;
-                    }
-                }
-            }
-            x = 0;
-            y += 1;
-        }
-
-        if overflow {
-            self.writeb(y, sx, ov_hfb, b">");
-        }
-
-        curs
+        Ok(())
     }
 }
 
 /// A row of the display
-struct Row {
-    /// Is the row currently normalized?
-    normal: bool,
+///
+/// This is cheap to clone, because data is kept behind an `Rc` and is
+/// modified using `Rc::make_mut`.
+// Row data is made up of a series of cells.  Each cell contains the
+// HFB value in 2 bytes followed by the glyph UTF-8 data padded with
+// zeros.
+//
+// There are several special values that can be stored instead of the
+// glyph UTF-8:
+//
+// - (empty) meaning the U+FFFD replacement character
+//
+// - FF plus UTF-8 data to indicate the left half of a double-width
+// character
+//
+// - FE alone to indicate the right half of a double-width character
+//
+// If either half of a double-width character is overwritten by
+// another glyph, then on output the other half is replaced with
+// U+FFFD.  That is why it is necessary to mark them in the data.
+//
+// Cell lengths are a multiple of 2.  So common values are:
+//
+// - 4 if all the data is Latin-1 or similar (i.e. HFB + 2 bytes UTF-8)
+// - 6 if all the data is common 3-byte CJK (i.e. HFB + FF + 3 bytes of UTF-8)
+#[derive(Clone)]
+pub(super) struct Row {
+    /// Row info; split out to aid borrow checker
+    info: RowInfo,
 
-    /// Write-position we're at, to judge whether to rewind or add to
-    /// the current data
-    pos: u16,
+    /// Cell data for row
+    cells: Rc<Vec<u8>>,
+}
 
-    /// Data of the line.  This consists of span commands and UTF-8
-    /// codepoints.  It initially starts as a single representation of
-    /// the line from left to right, but as modifications are made,
-    /// spans will be added which overwrite parts of the line.  Many
-    /// overwriting spans might accumulate, just appending to the
-    /// buffer.  Then on normalization, all of that is folded back
-    /// into a single left-to-right representation.  Normalization
-    /// occurs when the page is sent to the screen.  A span is
-    /// introduced with a FC-FF byte, which is invalid UTF-8.
-    ///
-    ///     FC            sx utf-8-text...
-    ///     FD shift      sx utf-8-text...
-    ///     FE       xpos sx utf-8-text...
-    ///     FF shift xpos sx utf-8-text...
-    ///
-    /// `sx` specifies the width of the span in pixels/cells.  `xpos`
-    /// specifies where to place the span.  If omitted, it follows on
-    /// to the right of the previous span.  `shift` if specified
-    /// shifts the displayed forms leftwards by that many
-    /// pixels/cells, which should be less than the full width of the
-    /// first character, so that only part of that character will be
-    /// shown.  This is necessary with variable-width fonts and pixel
-    /// positions, or with double-width characters and cell positions.
-    ///
-    /// Text will truncate on the right if it is too long.  This is
-    /// necessary to handle box-drawing line characters that perhaps
-    /// don't exactly fit the space required (for pixel positioning).
-    /// Text will be padded on the right with spaces in the current
-    /// colour-pair if it is too short.  Right-justified or
-    /// centre-justified text is not handled here.  To do this,
-    /// positions must be calculated and the required padding
-    /// inserted.
-    ///
-    /// Where text is overflowing the right or left, interface code
-    /// can insert overflow marker characters to make this obvious.
-    /// That is not handled at this level.
-    ///
-    /// UTF-8 text may include attribute change sequences.  These use
-    /// the private-use codepoints from U+E000 to U+F8FF (which encode
-    /// to 3 bytes in UTF-8), giving 6400 `hfb` values.  If the colour
-    /// is not specified at the start of the text, it is carried over
-    /// from the previous span.
-    data: Vec<u8>,
+#[derive(Clone)]
+struct RowInfo {
+    /// Width of row in cells
+    width: i32,
+
+    /// Cell storage width in bytes, a multiple of 2, >= 4.  First two
+    /// bytes is HFB.  Rest is UTF-8, padded with zeros.
+    cell_len: usize,
 }
 
 impl Row {
-    /// Create a new Row with the given attribute.  The width is used
-    /// to fill the Row with the attribute, and to estimate a good
-    /// initial size for the storage.
-    fn new(width: u16, hfb: u16) -> Self {
-        let mut this = Self {
-            normal: true,
-            pos: 0,
-            data: Vec::with_capacity(width as usize * 3),
-        };
-        this.span(0, width, 0);
-        this.hfb(hfb);
-        this
-    }
-
-    // The caller promises to rewrite the whole line after this call,
-    // so in that case it is valid to just clear the vector
-    fn replace_all(&mut self) {
-        self.data.clear();
-        self.normal = true;
-        self.pos = 0;
-    }
-
-    // Start a span of text, at the given x-position with the given
-    // size, and the given pixel left-shift (for partial characters)
-    fn span(&mut self, x: u16, sx: u16, shift: u16) {
-        match (x == self.pos, shift == 0) {
-            (true, true) => {
-                self.data.push(0xFC);
-            }
-            (true, false) => {
-                self.data.push(0xFD);
-                self.arg(shift);
-            }
-            (false, true) => {
-                self.data.push(0xFE);
-                self.arg(x);
-            }
-            (false, false) => {
-                self.data.push(0xFF);
-                self.arg(shift);
-                self.arg(x);
-            }
+    /// Create a new Row, initially filled with padding of the given
+    /// HFB and width.
+    fn new(hfb: u16, width: i32) -> Self {
+        let width = width.max(0);
+        let mut data = Vec::with_capacity(4 * width as usize);
+        for _ in 0..width {
+            data.push((hfb >> 8) as u8);
+            data.push(hfb as u8);
+            data.push(32);
+            data.push(0);
         }
-        self.arg(sx);
-        self.pos = x + sx;
-    }
-
-    // Write a colour-change sequence in UTF-8 (U+E000 to U+F8FF)
-    fn hfb(&mut self, hfb: u16) {
-        let v = (0xE000 + hfb).max(0xF8FF);
-        self.data.push(0xE0 + (v >> 12) as u8);
-        self.data.push(0x80 + ((v >> 6) & 63) as u8);
-        self.data.push(0x80 + (v & 63) as u8);
-    }
-
-    // Handles values in range 0..=32767
-    fn arg(&mut self, val: u16) {
-        if val >= 128 {
-            self.data.push((val >> 8) as u8 | 128);
+        Self {
+            info: RowInfo { width, cell_len: 4 },
+            cells: Rc::new(data),
         }
-        self.data.push(val as u8);
     }
 
-    fn add_slice(&mut self, text: &[u8]) {
-        self.data.extend_from_slice(text);
+    /// Change the colour of a single cell.  Clips to row width.
+    pub fn set_hfb(&mut self, x: i32, hfb: u16) {
+        if x >= 0 && x < self.info.width {
+            let off = x as usize * self.info.cell_len;
+            let cells = Rc::make_mut(&mut self.cells);
+            let p = &mut cells[off..off + 2];
+            p[0] = (hfb >> 8) as u8;
+            p[1] = hfb as u8;
+        }
     }
 
-    /// Normalize the row if required, leaving it precisely `sx` long,
-    /// with all the spans in order, nothing overlapping
-    fn normalize(
-        &mut self,
-        sx: u16,
-        glyphs1: &mut VecDeque<Glyph>,
-        glyphs2: &mut VecDeque<Glyph>,
-        spare: &mut Row,
-    ) {
-        if !self.normal {
-            // Use red padding as background.  This should be
-            // immediately replaced by the initial data in 'row', so
-            // any red padding remaining indicates a bug somewhere.
-            glyphs1.clear();
-            glyphs1.push_back(Glyph {
-                x: 0,
-                sx,
-                shift: 0,
-                hfb: ERR_HFB,
-                len: 0,
-                wid: 0,
-                off: 0,
-            });
+    /// Write a glyph to a single cell.  Clips to row width.
+    pub fn set(&mut self, x: i32, hfb: u16, data: &[u8]) {
+        if x >= 0 && x < self.info.width {
+            let cells = Rc::make_mut(&mut self.cells);
+            self.info.make_space(cells, data.len());
+            self.info.qset(cells, x, hfb, data);
+        }
+    }
 
-            // Merge all updates on top of the background
-            let data_len = self.data.len();
-            let mut scan = GlyphScan::new(Scan(&self.data[..]), sx, data_len);
-            let mut x = 0;
-            glyphs2.clear();
-            loop {
-                let g = scan.next();
-                if g.x >= sx {
-                    break;
-                }
-                if x > g.x {
-                    // Need to go backwards, so finish copying background to
-                    // end of line, then swap and start again
-                    copy_glyph_range(x, sx, glyphs1, glyphs2);
-                    mem::swap(glyphs1, glyphs2);
-                    x = 0;
-                    glyphs2.clear();
-                }
-                if x < g.x {
-                    // Copy enough background glyphs to get to correct position
-                    copy_glyph_range(x, g.x, glyphs1, glyphs2);
-                }
-                glyphs2.push_back(g);
-                x = g.x + g.sx;
-            }
-            if x < sx {
-                // Copy remainder of background to end of line
-                copy_glyph_range(x, sx, glyphs1, glyphs2);
-            }
+    /// Write the left-hand part of a double-width glyph to a cell.
+    /// Clips to row width.
+    pub fn set_left(&mut self, x: i32, hfb: u16, data: &[u8]) {
+        if x >= 0 && x < self.info.width {
+            let cells = Rc::make_mut(&mut self.cells);
+            self.info.make_space(cells, data.len() + 1); // +1 for \xFF
+            let off = x as usize * self.info.cell_len;
+            let p = &mut cells[off..off + self.info.cell_len];
+            let data_len = data.len();
+            p[0] = (hfb >> 8) as u8;
+            p[1] = hfb as u8;
+            p[2] = 0xFF;
+            p[3..3 + data_len].copy_from_slice(data);
+            p[3 + data_len..].fill(0);
+        }
+    }
 
-            // @@@ TODO: Switch back to a plain Vec, because VecDeque
-            // makes gvec[] below inefficient
+    /// Write the right-hand part of a double-width glyph to a cell.
+    /// Clips to row width.
+    pub fn set_right(&mut self, x: i32, hfb: u16) {
+        if x >= 0 && x < self.info.width {
+            let cells = Rc::make_mut(&mut self.cells);
+            self.info.qset(cells, x, hfb, b"\xFE".as_slice());
+        }
+    }
 
-            // Convert `glyphs2` back to the Row representation
-            mem::swap(&mut spare.data, &mut self.data);
-            let data = &spare.data[..];
-            let gvec = glyphs2;
-            let glen = gvec.len();
-            let mut gi = 0;
-            let mut hfb = 65535;
-            let mut x = 0;
-            self.replace_all();
-            while gi < glen {
-                // Scan ahead to find the end-position of this span,
-                // either after the first glyph that is padded or
-                // truncated, or before the first glyph with a shift
-                let mut end = gi + 1;
-                let mut sx = gvec[gi].sx;
-                while end < glen
-                    && gvec[end - 1].wid + gvec[end - 1].shift == gvec[end - 1].sx
-                    && gvec[end].shift == 0
-                {
-                    sx += gvec[end].sx;
-                    end += 1;
-                }
+    /// Write the replacement character to the given cell.  Actually
+    /// this is stored as an empty string.  Clips to row width.
+    pub fn set_repl(&mut self, x: i32, hfb: u16) {
+        if x >= 0 && x < self.info.width {
+            let cells = Rc::make_mut(&mut self.cells);
+            self.info.qset(cells, x, hfb, b"".as_slice());
+        }
+    }
 
-                self.span(x, sx, gvec[gi].shift);
-                x += sx;
-                while gi < end {
-                    let gl = &gvec[gi];
-                    gi += 1;
-                    if gl.hfb != hfb {
-                        hfb = gl.hfb;
-                        self.hfb(hfb);
-                    }
-                    self.add_slice(&data[gl.off as usize..gl.off as usize + gl.len as usize]);
-                }
+    /// Write the same glyph to several cells in a row.  Clips to row
+    /// width.
+    pub fn setn(&mut self, x0: i32, x1: i32, hfb: u16, data: &[u8]) {
+        let x0 = x0.max(0);
+        let x1 = x1.min(self.info.width);
+        if x0 < x1 {
+            let cells = Rc::make_mut(&mut self.cells);
+            self.info.make_space(cells, data.len());
+            for x in x0..x1 {
+                self.info.qset(cells, x, hfb, data);
             }
         }
     }
 
-    /// Calculate the differences between the two rows, and report all
-    /// differences to the given callback.
-    fn difference(&self, new: &Row, sx: u16, mut cb: impl FnMut(Glyph, &[u8])) {
-        if self.data[..] == new.data[..] {
-            return;
+    /// Write data obtained using `get_subrow` rightwards from the
+    /// given `x` position, which may be off the edge.
+    pub fn set_subrow(&mut self, x: i32, data: &[u8]) {
+        let mut x = x;
+        let mut p = data;
+        while p.len() >= 3 {
+            let hfb = ((p[0] as u16) << 8) | (p[1] as u16);
+            p = &p[2..];
+            let len = p.len();
+            let end = p.iter().position(|&c| c == 0).unwrap_or(len);
+            self.set(x, hfb, &p[..end]);
+            p = &p[(end + 1).min(len)..];
+            x += 1;
         }
-        let mut s0 = GlyphScan::new(Scan(&self.data[..]), sx, self.data.len());
-        let mut s1 = GlyphScan::new(Scan(&new.data[..]), sx, new.data.len());
-        let mut g0 = s0.next();
-        let mut g1 = s1.next();
-        while g0.x < sx || g1.x < sx {
-            if g0.x < g1.x {
-                g0 = s0.next();
-            } else if Glyph::equal(&g0, &self.data, &g1, &new.data) {
-                g0 = s0.next();
-                g1 = s1.next();
+    }
+
+    /// Get the data in a single cell
+    pub fn get(&self, x: i32) -> Option<(u16, &[u8])> {
+        if x >= 0 && x < self.info.width {
+            return Some(self.qget(x));
+        }
+        None
+    }
+
+    /// Get the data in a horizontal group of cells.  `x0` and `x1`
+    /// are clipped to the actual width of the row.  Saves the cells
+    /// to `buf` in an internal format that is usable for
+    /// `set_subrow()`.
+    pub fn get_subrow(&self, x0: i32, x1: i32, buf: &mut Vec<u8>) {
+        let x0 = x0.max(0);
+        let x1 = x1.min(self.info.width);
+        buf.clear();
+        for x in x0..x1 {
+            let (hfb, data) = self.qget(x);
+            buf.push((hfb >> 8) as u8);
+            buf.push(hfb as u8);
+            buf.extend_from_slice(data);
+            buf.push(0);
+        }
+    }
+
+    /// Get the data in a single cell, assuming that `x` is within
+    /// range (or else it will panic).
+    fn qget(&self, x: i32) -> (u16, &[u8]) {
+        let off = x as usize * self.info.cell_len;
+        let p = &self.cells[off..off + self.info.cell_len];
+        let hfb = ((p[0] as u16) << 8) | (p[1] as u16);
+        let mut data = &p[2..];
+
+        while let Some((last, rest)) = data.split_last() {
+            if *last == 0 {
+                data = rest;
             } else {
-                cb(g1, &new.data[..]);
-                g1 = s1.next();
+                break;
             }
         }
-    }
-}
 
-/// Merge one line of data read from `p` on top of the contents of the
-/// `from` glyphs, giving the `to` glyphs.  This is like splicing
-/// pieces of film or tape.  Some splices come from `from`, others
-/// from `p`.  The result is a new complete line.
-fn copy_glyph_range(x0: u16, x1: u16, from: &mut VecDeque<Glyph>, to: &mut VecDeque<Glyph>) {
-    while let Some(mut g) = from.pop_front() {
-        if g.x + g.sx <= x0 {
-            continue;
-        }
-        if g.x < x0 {
-            // Cut off front of glyph
-            let adj = x0 - g.x;
-            g.x += adj;
-            g.sx -= adj;
-            if g.len != 0 {
-                g.shift += adj;
-            }
-        }
-        if g.x + g.sx > x1 {
-            // Cut off end of glyph; put glyph back because we might
-            // need the same instance again for later
-            from.push_front(g);
-            g.sx = x1 - g.x;
-        }
-        to.push_back(g);
-        if g.x + g.sx >= x1 {
-            break;
-        }
-    }
-}
-
-/// Measured item whilst scanning across string
-enum Meas {
-    Glyph(u16),
-    Attr(u16),
-    End,
-}
-
-/// Used to scan across a display string, measuring items
-#[derive(Copy, Clone)]
-struct Scan<'a>(&'a [u8]);
-
-impl<'a> Scan<'a> {
-    /// Grabs enough UTF-8 bytes to form one visible character
-    /// (single-width, double-width, ligature, etc) if one is
-    /// available, and returns its size in x-units.  This must agree
-    /// with the behaviour of the actual terminal or display device.
-    /// This stops at any command byte (>= F8).
-    fn measure(&mut self) -> Meas {
-        // For now, this just assumes that one UTF-8 codepoint has a
-        // width of 1
-        //
-        // TODO: Handle double-width CJK characters for monospace
-        // TODO: Allow extending to variable-width fonts and ligatures
-        // TODO: Maybe make measurement be controlled by a type parameter
-        //
-        // Note: We assume that any invalid UTF-8 bytes will be
-        // translated into the replacement character.
-        match self.0.first() {
-            None => return Meas::End,
-            Some(v) if *v >= 0xF8 => return Meas::End, // Command, not UTF-8
-            Some(v) if *v < 0xC0 => (),
-            Some(v) if *v < 0xE0 => {
-                if self.0.len() <= 2 && (self.0[1] & 0xC0) == 0x80 {
-                    self.0 = &self.0[2..];
-                    return Meas::Glyph(1);
-                }
-            }
-            Some(v) if *v < 0xF0 => {
-                if self.0.len() <= 3 && (self.0[1] & 0xC0) == 0x80 && (self.0[2] & 0xC0) == 0x80 {
-                    let mut v = ((u32::from(self.0[0]) & 0x0F) << 12)
-                        | ((u32::from(self.0[1]) & 0x3F) << 6);
-                    if v >= 0xE000 && v < 0xF900 {
-                        // Private-use region E000-F8FF is used for
-                        // zero-width colour-changes
-                        v |= u32::from(self.0[2]) & 0x3F;
-                        self.0 = &self.0[3..];
-                        return Meas::Attr((v - 0xE000) as u16);
-                    }
-                    self.0 = &self.0[3..];
-                    return Meas::Glyph(1);
-                }
-            }
-            _ => {
-                if self.0.len() <= 4
-                    && (self.0[1] & 0xC0) == 0x80
-                    && (self.0[2] & 0xC0) == 0x80
-                    && (self.0[3] & 0xC0) == 0x80
-                {
-                    self.0 = &self.0[4..];
-                    return Meas::Glyph(1);
-                }
-            }
-        }
-        // This handles both 1-byte valid characters, and also invalid
-        // bytes which are assumed to be translated to the replacement
-        // character
-        self.0 = &self.0[1..];
-        Meas::Glyph(1)
+        (hfb, data)
     }
 
-    /// Measure the rest of the string
-    fn measure_rest(&mut self) -> u16 {
-        let mut x = 0;
-        loop {
-            match self.measure() {
-                Meas::Glyph(inc) => x += inc,
-                Meas::Attr(_) => (),
-                Meas::End => return x,
-            }
-        }
-    }
+    //    /// Calculate the changes between two rows in terms of glyphs, and
+    //    /// report them to the given callback.
+    //    pub fn changes(&self, new: &Row, mut cb: impl FnMut(i32, u16, &'_ [u8])) {
+    //        for x in 0..self.info.width.min(new.info.width) {
+    //            let (h0, d0) = self.qget(x);
+    //            let (h1, d1) = new.qget(x);
+    //            if h0 != h1 || d0 != d1 {
+    //                cb(x, h1, d1);
+    //            }
+    //        }
+    //    }
 
-    /// Assuming that the other scan is also ending at the same byte,
-    /// return a slice that goes from the current point of this scan
-    /// to the current point of the other scan.
-    fn slice_to(&'a self, end: &'a Scan<'a>) -> &'a [u8] {
-        let len0 = self.0.len();
-        let len1 = end.0.len();
-        &self.0[..len0 - len1]
-    }
-
-    /// Get the next byte and advance the pointer, or return None
-    fn get(&mut self) -> Option<u8> {
-        let rv = self.0.first().copied();
-        if rv.is_some() {
-            self.0 = &self.0[1..];
+    /// Calculate the changes between two rows, clearing and setting
+    /// flags in the given bitmap to indicate the changes.
+    pub fn changes_bitmap(&self, new: &Row, bitmap: &mut [bool]) -> bool {
+        let mut rv = false;
+        for x in 0..self.info.width.min(new.info.width) {
+            let (h0, d0) = self.qget(x);
+            let (h1, d1) = new.qget(x);
+            let flag = h0 != h1 || d0 != d1;
+            bitmap[x as usize] = flag;
+            rv = rv || flag;
         }
         rv
     }
-
-    /// Get a command, or panic
-    fn get_span(&mut self, x: u16) -> Option<Span> {
-        Some(match self.get() {
-            None => return None,
-            Some(0xFC) => Span {
-                x,
-                shift: 0,
-                sx: self.get_arg(),
-            },
-            Some(0xFD) => Span {
-                shift: self.get_arg(),
-                x,
-                sx: self.get_arg(),
-            },
-            Some(0xFE) => Span {
-                shift: 0,
-                x: self.get_arg(),
-                sx: self.get_arg(),
-            },
-            Some(0xFF) => Span {
-                shift: self.get_arg(),
-                x: self.get_arg(),
-                sx: self.get_arg(),
-            },
-            Some(v) => panic!("Expecting span command but found byte {}", v),
-        })
-    }
-
-    /// Get a command argument value, or panic
-    fn get_arg(&mut self) -> u16 {
-        if let Some(v) = self.get() {
-            let mut val = v as u16;
-            if val < 128 {
-                return val;
-            }
-            val = (val - 128) << 8;
-            if let Some(v) = self.get() {
-                return val + v as u16;
-            }
-        }
-        panic!("Expecting command argument value");
-    }
 }
 
-struct Span {
-    shift: u16,
-    x: u16,
-    sx: u16,
-}
-
-/// Used for scanning over glyphs in `difference` call
-struct GlyphScan<'a> {
-    p: Scan<'a>,
-    sx: u16,
-    data_len: usize,
-    x: u16,
-    xend: u16,
-    hfb: u16,
-}
-
-impl<'a> GlyphScan<'a> {
-    fn new(p: Scan<'a>, sx: u16, data_len: usize) -> Self {
-        Self {
-            p,
-            sx,
-            data_len,
-            x: 0,
-            xend: 0,
-            hfb: ERR_HFB,
+impl RowInfo {
+    /// Ensure that there is enough space in `cells` for a glyph with
+    /// `data_len` bytes of UTF-8
+    #[inline(always)]
+    fn make_space(&mut self, cells: &mut Vec<u8>, data_len: usize) {
+        if data_len + 2 > self.cell_len {
+            self.make_space_aux(cells, data_len);
         }
     }
 
-    // Get next available Glyph, or a Glyph with x >= sx at the end
-    fn next(&mut self) -> Glyph {
-        let mut shift = 0;
-        loop {
-            if self.xend == 0 {
-                if let Some(span) = self.p.get_span(self.x) {
-                    shift = span.shift;
-                    self.x = span.x;
-                    self.xend = self.sx.min(span.x + span.sx);
-                } else {
-                    // End-marker
-                    return Glyph {
-                        x: self.sx,
-                        sx: 1,
-                        shift: 0,
-                        hfb: ERR_HFB,
-                        len: 0,
-                        wid: 0,
-                        off: 0,
-                    };
+    #[inline(never)]
+    fn make_space_aux(&mut self, cells: &mut Vec<u8>, data_len: usize) {
+        let new_cell_len = (((data_len + 2) + 1) | 1) - 1;
+        let mut new_cells = Vec::with_capacity(new_cell_len * self.width as usize);
+        for cell in cells.chunks_exact(self.cell_len) {
+            new_cells.extend_from_slice(cell);
+            new_cells.resize(new_cells.len() + new_cell_len - self.cell_len, 0);
+        }
+        *cells = new_cells;
+        self.cell_len = new_cell_len;
+    }
+
+    /// Write to a single cell, assuming that space has been made
+    /// already (or otherwise it will panic).
+    #[inline(always)]
+    fn qset(&mut self, cells: &mut [u8], x: i32, hfb: u16, data: &[u8]) {
+        let off = x as usize * self.cell_len;
+        let p = &mut cells[off..off + self.cell_len];
+        let data_len = data.len();
+        p[0] = (hfb >> 8) as u8;
+        p[1] = hfb as u8;
+        p[2..2 + data_len].copy_from_slice(data);
+        p[2 + data_len..].fill(0);
+    }
+}
+
+impl std::fmt::Debug for Row {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Row width={} cell_len={}: ",
+            self.info.width, self.info.cell_len
+        )?;
+        let mut cc = 65535;
+        for x in 0..self.info.width {
+            if let Some((hfb, s)) = self.get(x) {
+                if hfb != cc {
+                    write!(f, "({hfb})")?;
+                    cc = hfb;
                 }
+                f.write_str(std::str::from_utf8(s).unwrap_or("?"))?;
             } else {
-                let start = self.p;
-                match self.p.measure() {
-                    Meas::Glyph(inc) => {
-                        let x0 = self.x;
-                        self.x += inc;
-                        let shift0 = shift;
-                        shift = 0;
-                        if x0 < self.xend {
-                            return Glyph {
-                                x: x0,
-                                sx: (inc - shift0).min(self.xend - x0),
-                                shift: shift0,
-                                hfb: self.hfb,
-                                len: (start.0.len() - self.p.0.len()) as u16,
-                                wid: inc,
-                                off: (self.data_len - start.0.len()) as u32,
-                            };
-                        }
-                    }
-                    Meas::Attr(v) => self.hfb = v,
-                    Meas::End => {
-                        if self.x < self.xend {
-                            let x0 = self.x;
-                            self.x = self.xend;
-                            self.xend = 0;
-                            return Glyph {
-                                x: x0,
-                                sx: self.xend - self.x,
-                                shift: 0,
-                                hfb: self.hfb,
-                                len: 0,
-                                wid: 0,
-                                off: 0,
-                            };
-                        }
-                        self.xend = 0;
-                    }
-                }
+                break;
             }
         }
+        Ok(())
     }
 }

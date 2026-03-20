@@ -1,8 +1,8 @@
 # ANSI terminal handling for Stakker
 
-**This is a work-in-progress.** Only basic handling on UNIX is
-supported at the moment: output buffering, input key decoding and
-window resize detection.
+**This is a work-in-progress.** Only UNIX is supported at the moment:
+output buffering, input key decoding and window resize detection,
+minimized updates (like curses) and tile-based layouts.
 
 ### Documentation
 
