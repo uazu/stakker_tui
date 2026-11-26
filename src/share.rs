@@ -924,29 +924,64 @@ fn closest_8(c: u32) -> u16 {
 }
 
 /// Find the closest colour in the standard 256-colour palette to the
-/// given 0xRRGGBB colour
+/// given 0xRRGGBB colour.  Only the 6x6x6 colour cube (16-231) and
+/// the greyscale ramp (232-255) are considered, since colours 0-15
+/// are often reconfigured by the user.
 fn closest_256(c: u32) -> u16 {
-    let r = ((c & 0xFF0000) >> 16) as u16;
-    let g = ((c & 0xFF00) >> 8) as u16;
-    let b = (c & 0xFF) as u16;
+    let r = ((c & 0xFF0000) >> 16) as i32;
+    let g = ((c & 0xFF00) >> 8) as i32;
+    let b = (c & 0xFF) as i32;
 
-    fn sqr_dist(a: u16, b: u16) -> i32 {
-        let d = a as i32 - b as i32;
+    fn sqr_dist(a: i32, b: i32) -> i32 {
+        let d = a - b;
         d * d
     }
 
-    // Check colour set first, 0-5 in each of R,G,B: 216 colours
-    let ri = (r + 25) / 51; // Round to nearest
-    let gi = (g + 25) / 51;
-    let bi = (b + 25) / 51;
+    // Colour cube: levels used by xterm and most other terminals
+    const LEVELS: [i32; 6] = [0, 95, 135, 175, 215, 255];
+    let nearest = |v: i32| (0..6).min_by_key(|&i| sqr_dist(v, LEVELS[i])).unwrap_or(0);
+    let (ri, gi, bi) = (nearest(r), nearest(g), nearest(b));
     let ci = 16 + ri * 36 + gi * 6 + bi;
-    let ci_dist = sqr_dist(r, ri * 51) + sqr_dist(g, gi * 51) + sqr_dist(b, bi * 51);
+    let ci_dist = sqr_dist(r, LEVELS[ri]) + sqr_dist(g, LEVELS[gi]) + sqr_dist(b, LEVELS[bi]);
 
-    // Check greyscale section, 24 colours
-    let av = (r + g + b) / 3;
-    let wi = 232 + (((av + 5) * 23) >> 8);
-    let wv = wi * 255 / 23;
+    // Greyscale ramp: 24 levels, 8 + 10 * i.  The nearest to the
+    // average is the nearest overall.
+    let av = (r + g + b + 1) / 3;
+    let wi = ((av - 8 + 5) / 10).clamp(0, 23);
+    let wv = 8 + 10 * wi;
     let wi_dist = sqr_dist(r, wv) + sqr_dist(g, wv) + sqr_dist(b, wv);
 
-    if ci_dist < wi_dist { ci } else { wi }
+    if ci_dist <= wi_dist {
+        ci as u16
+    } else {
+        232 + wi as u16
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::closest_256;
+
+    #[test]
+    fn colour_cube() {
+        assert_eq!(closest_256(0x000000), 16);
+        assert_eq!(closest_256(0xFFFFFF), 231);
+        assert_eq!(closest_256(0xFF0000), 196);
+        assert_eq!(closest_256(0x00AF00), 34);
+        assert_eq!(closest_256(0x00005F), 17);
+        assert_eq!(closest_256(0x005F5F), 23);
+        assert_eq!(closest_256(0xB8860B), 136);
+        assert_eq!(closest_256(0xD7AF00), 178);
+        assert_eq!(closest_256(0x5F5F5F), 59);
+        assert_eq!(closest_256(0x878787), 102);
+    }
+
+    #[test]
+    fn greyscale() {
+        assert_eq!(closest_256(0x080808), 232);
+        assert_eq!(closest_256(0x303030), 236);
+        assert_eq!(closest_256(0xD0D0D0), 252);
+        assert_eq!(closest_256(0xEEEEEE), 255);
+        assert_eq!(closest_256(0x333333), 236);
+    }
 }

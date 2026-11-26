@@ -4,6 +4,10 @@ This project follows Rust semantic versioning.
 
 <!-- see keepachangelog.com for format ideas -->
 
+## 0.1.1 (2026-11-26)
+
+- Fix 256-colour 6x6 colour cube levels to match common terminals
+
 ## 0.1.0 (2026-03-22)
 
 ### Additions
